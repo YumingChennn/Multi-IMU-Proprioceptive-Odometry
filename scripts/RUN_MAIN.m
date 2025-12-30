@@ -9,17 +9,27 @@ warning('off')
 % read rosbag, modify the path for different dataset
 disp('read rosbag');
 
-file_path = ['/home/shuoyang/rosbag/20230215_aaron_lab/',...
-    '_2023-02-15-15-01-56.bag'] 
+% file_path = ['/home/ray/Multi-IMU-Proprioceptive-Odometry/dataset/_2023-02-15-15-01-56.bag'] 
 
-param.fl_imu_topic = '/WT901_49_Data';
-param.fr_imu_topic = '/WT901_48_Data';
-param.rl_imu_topic = '/WT901_50_Data';
-param.rr_imu_topic = '/WT901_47_Data';
-param.body_imu_topic = '/unitree_hardware/imu';
-param.mocap_topic = '/mocap_node/Go1_body/pose';
-param.mocap_FR_topic = '/mocap_node/Go1_FR/pose';
-param.joint_foot_topic = '/unitree_hardware/joint_foot';
+file_path = ['/home/ray/Multi-IMU-Proprioceptive-Odometry/dataset/output_ros1_4.bag'] 
+
+param.fl_imu_topic = '/imu/data/fl';
+param.fr_imu_topic = '/imu/data/fr';
+param.rl_imu_topic = '/imu/data/rl';
+param.rr_imu_topic = '/imu/data/rr';
+param.body_imu_topic = '/imu/data/base_link';
+param.mocap_topic = '/mocap/body/pose';
+param.mocap_FR_topic = '/mocap/fr/pose';
+param.joint_foot_topic = '/joint_states';
+
+% param.fl_imu_topic = '/WT901_49_Data';
+% param.fr_imu_topic = '/WT901_48_Data';
+% param.rl_imu_topic = '/WT901_50_Data';
+% param.rr_imu_topic = '/WT901_47_Data';
+% param.body_imu_topic = '/unitree_hardware/imu';
+% param.mocap_topic = '/mocap_node/Go1_body/pose';
+% param.mocap_FR_topic = '/mocap_node/Go1_FR/pose';
+% param.joint_foot_topic = '/unitree_hardware/joint_foot';
 
 
 %% read rosbag data

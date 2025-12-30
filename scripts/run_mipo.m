@@ -26,10 +26,10 @@ for i = 1:param.num_leg
 end
 
 x0 = [
-    init_pos;
-    zeros(3,1);
-    init_euler;
-    foot_pos_vel_list;
+    init_pos; % 機體位置(3)
+    zeros(3,1); % 機體速度(3)
+    init_euler; % 姿態(3, euler)
+    foot_pos_vel_list; % 足端位置/速度(6*num_leg)
     zeros(3,1);
     zeros(3,1);
     zeros(3,1);
@@ -49,6 +49,7 @@ cov_list(:,:,1) = P0;
 for idx=total_start_idx:total_end_idx
     k = idx-total_start_idx+1;
     dt = re_sensor_data.gyro_body_IMU.Time(idx+1) - re_sensor_data.gyro_body_IMU.Time(idx);
+    
     % convert foot acc from foot frame to body frame using FK rotation
     joint_angs = re_sensor_data.joint_ang.Data(idx,:)';
     accel_IMUs = [
@@ -56,13 +57,13 @@ for idx=total_start_idx:total_end_idx
                     re_sensor_data.accel_fr_IMU.Data(idx,:)';
                     re_sensor_data.accel_rl_IMU.Data(idx,:)';
                     re_sensor_data.accel_rr_IMU.Data(idx,:)';
-                 ];
+                 ]; % 12x1
     gyro_IMUs = [
                     re_sensor_data.gyro_fl_IMU.Data(idx,:)';
                     re_sensor_data.gyro_fr_IMU.Data(idx,:)';
                     re_sensor_data.gyro_rl_IMU.Data(idx,:)';
                     re_sensor_data.gyro_rr_IMU.Data(idx,:)';
-                 ];
+                 ]; % 12x1
     accel_IMU_bs = zeros(3*param.num_leg,1);    % from IMU fram to robot body frame
     gyro_IMU_bs = zeros(3*param.num_leg,1);
     for leg_id=1:param.num_leg
@@ -72,10 +73,10 @@ for idx=total_start_idx:total_end_idx
         gyro_IMU_bs((leg_id-1)*3+1:(leg_id-1)*3+3) = R_bf*param.R_fm_list{leg_id}*gyro_IMUs((leg_id-1)*3+1:(leg_id-1)*3+3);
     end
     uk = [
-            re_sensor_data.gyro_body_IMU.Data(idx,:)';
-            re_sensor_data.accel_body_IMU.Data(idx,:)';
-            accel_IMU_bs;
-            dt];
+            re_sensor_data.gyro_body_IMU.Data(idx,:)';  % 3
+            re_sensor_data.accel_body_IMU.Data(idx,:)'; % 3
+            accel_IMU_bs; % 3*num_leg
+            dt]; % 1
 
     joint_angs = re_sensor_data.joint_ang.Data(idx+1,:)';
     accel_IMUs = [
@@ -104,9 +105,9 @@ for idx=total_start_idx:total_end_idx
             accel_IMU_bs1;
             dt];
 
-    x01 = full(mipo_conf.f(x_list(:,k) , uk, uk1, dt));
-    F = full(mipo_conf.df(x_list(:,k) , uk, uk1, dt));
-    B = full(mipo_conf.db(x_list(:,k) , uk, uk1, dt));
+    x01 = full(mipo_conf.f(x_list(:,k) , uk, uk1, dt)); % 狀態轉移函數
+    F = full(mipo_conf.df(x_list(:,k) , uk, uk1, dt)); % 對狀態的 Jacobian
+    B = full(mipo_conf.db(x_list(:,k) , uk, uk1, dt)); % 對輸入/噪聲的 Jacobian
 
     mipo_conf.Q1 = diag([param.proc_n_pos* dt *ones(2,1); % pos x y
                          param.proc_n_pos* dt *ones(1,1);   % pos z
@@ -122,18 +123,19 @@ for idx=total_start_idx:total_end_idx
                          param.proc_n_ba *  dt *ones(3,1);    % acc bias random walk
                          param.proc_n_bg *  dt *ones(3,1);    % gyro bias random walk
                          param.proc_n_foot1_ba *  dt *ones(3,1);    % foot1 acc bias random walk
-                         param.proc_n_foot2_ba *  dt *ones(3,1);    % foot1 acc bias random walk
-                         param.proc_n_foot3_ba *  dt *ones(3,1);    % foot1 acc bias random walk
-                         param.proc_n_foot4_ba *  dt *ones(3,1);    % foot1 acc bias random walk
+                         param.proc_n_foot2_ba *  dt *ones(3,1);    % foot2 acc bias random walk
+                         param.proc_n_foot3_ba *  dt *ones(3,1);    % foot3 acc bias random walk
+                         param.proc_n_foot4_ba *  dt *ones(3,1);    % foot4 acc bias random walk
                          0;]);  
-  
-    % control noise 
-    mipo_conf.Q2 = diag([param.ctrl_n_acc * dt *ones(3,1);   % acc noise should be large around contact
-                         param.ctrl_n_gyro * dt *ones(3,1);   % gyro noise
-                         param.ctrl_n_foot1_acc * dt *ones(3,1);   % gyro noise
-                         param.ctrl_n_foot2_acc * dt *ones(3,1);   % gyro noise
-                         param.ctrl_n_foot3_acc * dt *ones(3,1);   % gyro noise
-                         param.ctrl_n_foot4_acc * dt *ones(3,1);   % gyro noise
+
+    
+    % control noise
+    mipo_conf.Q2 = diag([param.ctrl_n_acc * dt *ones(3,1);
+                         param.ctrl_n_gyro * dt *ones(3,1);
+                         param.ctrl_n_foot1_acc * dt *ones(3,1);
+                         param.ctrl_n_foot2_acc * dt *ones(3,1);
+                         param.ctrl_n_foot3_acc * dt *ones(3,1);
+                         param.ctrl_n_foot4_acc * dt *ones(3,1);
                          0]);  
            
     ck = double(re_sensor_data.contact_mode.Data(idx,:) ); 
@@ -153,27 +155,26 @@ for idx=total_start_idx:total_end_idx
         end
     end
 
-    P01 = F*cov_list(:,:,k)*F' + mipo_conf.Q1 + B*mipo_conf.Q2*B';
- 
+    P01 = F*cov_list(:,:,k)*F' + mipo_conf.Q1 + B*mipo_conf.Q2*B'; % P01：EKF 協方差預測
+    
     hat_wk = re_sensor_data.gyro_body_IMU.Data(idx,:)';
-    hat_phik = re_sensor_data.joint_ang.Data(idx,:)';
-    hat_dphik = re_sensor_data.joint_vel.Data(idx,:)';
+    hat_phik = re_sensor_data.joint_ang.Data(idx,:)'; % 關節角
+    hat_dphik = re_sensor_data.joint_vel.Data(idx,:)'; % 關節角速度
 
-    hat_yawk = re_sensor_data.orient_mocap_euler.Data(idx,3);
+    hat_yawk = re_sensor_data.orient_mocap_euler.Data(idx,3); % mocap yaw
 
-    y = full(mipo_conf.r(x01, hat_wk, hat_phik, hat_dphik, hat_yawk, gyro_IMU_bs));
-    H = full(mipo_conf.dr(x01, hat_wk, hat_phik, hat_dphik, hat_yawk, gyro_IMU_bs));
+    y = full(mipo_conf.r(x01, hat_wk, hat_phik, hat_dphik, hat_yawk, gyro_IMU_bs)); % 殘差 y
+    H = full(mipo_conf.dr(x01, hat_wk, hat_phik, hat_dphik, hat_yawk, gyro_IMU_bs)); % 量測 Jacobian H
 
     S = H*P01*H' + mipo_conf.R;
 
-    
     mask = ones(mipo_conf.meas_size,1);
     if (param.mipo_use_md_test_flag == 1)
         for i = 1:param.num_leg
             seg_mes = y((i-1)*num_meas+7:(i-1)*num_meas+9);
             seg_S = S((i-1)*num_meas+7:(i-1)*num_meas+9,(i-1)*num_meas+7:(i-1)*num_meas+9);
             MD = sqrt(seg_mes'*inv(seg_S)*seg_mes);
-            if MD > 1
+            if MD > 4
                 mask((i-1)*num_meas+7:(i-1)*num_meas+9) = zeros(3,1);
             end
         end

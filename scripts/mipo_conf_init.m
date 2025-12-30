@@ -90,16 +90,17 @@ kf_conf.dr = Function('meas_jac',{s_xk, s_wk, s_phik, s_dphik, s_yawk, s_foot_gy
 
 % foot IMU frame has a transformation wrt foot center 
 % FL FR RL RR
+% Original A1 orientation (commented out):
 param.R_fm_list = {[-1  0  0;
                0  0 -1;
                0 -1  0], 
              [-1   0   0; 
                0   0   1;
-               0   1   0],
+               0   1   0], 
              [-1  0  0;
                0  0 -1;
                0 -1  0],
              [-1   0  0; 
                0   0  1;
-               0   1  0]};
+               0   1   0]};
 end

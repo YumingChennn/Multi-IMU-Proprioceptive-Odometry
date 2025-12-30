@@ -113,7 +113,7 @@ for i=1:num_data
     time(i) = double(msgStructs{i}.Header.Stamp.Sec) + double(msgStructs{i}.Header.Stamp.Nsec)*10^-9;
     time(i) = time(i) - start_time;
     for j=1:param.num_leg
-        contact_mode_data(i,j) = msgStructs{i}.Velocity(12+j);
+        % contact_mode_data(i,j) = msgStructs{i}.Velocity(12+j);
         foot_force_data(i,j) = msgStructs{i}.Effort(12+j);
     end
     if i >=2 
@@ -131,14 +131,14 @@ contact_flag2 = foot_force_data(:,2) > 100;
 contact_flag3 = foot_force_data(:,3) > 100;
 contact_flag4 = foot_force_data(:,4) > 100;
 
-contact_mode_data = [contact_flag1 contact_flag2 contact_flag3 contact_flag4];
+contact_mode_data = [contact_flag1 contact_flag2 contact_flag3 contact_flag4 ];
 
 %%
 joint_ang_data = movmean(joint_ang_data,5,1);
 foot_force = timeseries(foot_force_data,time,'Name',"foot force");
 %% by analyzing figure comparing to joint angle and foot IMUs, I think there is a delay in contact sensor
-contact_time = max(time - 0.03, 0);
-contact_mode = timeseries(contact_mode_data,contact_time,'Name',"contact mode");
+% contact_time = max(time - 0.03, 0);
+contact_mode = timeseries(contact_mode_data, time ,'Name',"contact mode");
 
 joint_ang = timeseries(joint_ang_data,time,'Name',"joint angle");
 joint_torque_data = movmean(joint_torque_data,5,1);
@@ -171,7 +171,7 @@ accel_fl_IMU.Time = accel_fl_IMU.Time - accel_fl_IMU.Time(1);
 gyro_fl_IMU = timeseries(bSel_fl,"AngularVelocity.X","AngularVelocity.Y","AngularVelocity.Z");
 gyro_fl_IMU.Time = gyro_fl_IMU.Time - delay_time_est;
 gyro_fl_IMU.Time = gyro_fl_IMU.Time-gyro_fl_IMU.Time(1);
-gyro_fl_IMU.Data = gyro_fl_IMU.Data/180*pi; % deg to rad
+% gyro_fl_IMU.Data = gyro_fl_IMU.Data/180*pi; % deg to rad
 sensor_data.accel_fl_IMU = accel_fl_IMU;
 sensor_data.gyro_fl_IMU = gyro_fl_IMU;
 
@@ -179,10 +179,11 @@ bSel_fr = select(bagselect,"Time",[start_time start_time + duration],'Topic',par
 accel_fr_IMU = timeseries(bSel_fr,"LinearAcceleration.X","LinearAcceleration.Y","LinearAcceleration.Z");
 accel_fr_IMU.Time = accel_fr_IMU.Time - delay_time_est;
 accel_fr_IMU.Time = accel_fr_IMU.Time-accel_fr_IMU.Time(1);
+
 gyro_fr_IMU = timeseries(bSel_fr,"AngularVelocity.X","AngularVelocity.Y","AngularVelocity.Z");
 gyro_fr_IMU.Time = gyro_fr_IMU.Time - delay_time_est;
 gyro_fr_IMU.Time = gyro_fr_IMU.Time-gyro_fr_IMU.Time(1);
-gyro_fr_IMU.Data = gyro_fr_IMU.Data/180*pi; % deg to rad
+% gyro_fr_IMU.Data = gyro_fr_IMU.Data/180*pi; % deg to rad
 sensor_data.accel_fr_IMU = accel_fr_IMU;
 sensor_data.gyro_fr_IMU = gyro_fr_IMU;
 
@@ -193,7 +194,7 @@ accel_rl_IMU.Time = accel_rl_IMU.Time-accel_rl_IMU.Time(1);
 gyro_rl_IMU = timeseries(bSel_rl,"AngularVelocity.X","AngularVelocity.Y","AngularVelocity.Z");
 gyro_rl_IMU.Time = gyro_rl_IMU.Time - delay_time_est;
 gyro_rl_IMU.Time = gyro_rl_IMU.Time-gyro_rl_IMU.Time(1);
-gyro_rl_IMU.Data = gyro_rl_IMU.Data/180*pi; % deg to rad
+% gyro_rl_IMU.Data = gyro_rl_IMU.Data/180*pi; % deg to rad
 sensor_data.accel_rl_IMU = accel_rl_IMU;
 sensor_data.gyro_rl_IMU = gyro_rl_IMU;
 
@@ -205,7 +206,7 @@ accel_rr_IMU.Time = accel_rr_IMU.Time-accel_rr_IMU.Time(1);
 gyro_rr_IMU = timeseries(bSel_rr,"AngularVelocity.X","AngularVelocity.Y","AngularVelocity.Z");
 gyro_rr_IMU.Time = gyro_rr_IMU.Time - delay_time_est;
 gyro_rr_IMU.Time = gyro_rr_IMU.Time-gyro_rr_IMU.Time(1);
-gyro_rr_IMU.Data = gyro_rr_IMU.Data/180*pi; % deg to rad
+% gyro_rrIMU.Data = gyro_rr_IMU.Data/180*pi; % deg to rad
 sensor_data.accel_rr_IMU = accel_rr_IMU;
 sensor_data.gyro_rr_IMU = gyro_rr_IMU;
 

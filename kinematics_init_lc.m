@@ -12,12 +12,18 @@ param.leg_name = ['FL','FR','RL', 'RR'];
 param.all_leg = [1,2,3,4];
 % assume all legs are active 
 param.active_leg = [1,1,1,1];
-param.ox = [0.1805,0.1805,-0.1805,-0.1805];
-param.oy = [0.047,-0.047,0.047,-0.047];
-param.d = [0.0838,-0.0838,0.0838,-0.0838];
-% param.d = [0.09,-0.09,0.09,-0.09];
-param.lt = 0.20;
-param.lc = 0.20;
+% Go2 robot parameters from URDF
+param.ox = [0.1934,0.1934,-0.1934,-0.1934];   % Hip offset X (from base to hip joint)
+param.oy = [0.0465,-0.0465,0.0465,-0.0465];   % Hip offset Y (from base to hip joint)
+param.d = [0.0955,-0.0955,0.0955,-0.0955];    % Hip offset Z (abad link length)
+param.lt = 0.213;  % Thigh length (from thigh joint to calf joint)
+param.lc = 0.213;  % Calf length (from calf joint to foot)
+% param.ox = [0.1805,0.1805,-0.1805,-0.1805];
+% param.oy = [0.047,-0.047,0.047,-0.047];
+% param.d = [0.0838,-0.0838,0.0838,-0.0838];
+% % param.d = [0.09,-0.09,0.09,-0.09];
+% param.lt = 0.20;
+% param.lc = 0.20;
 
 param.rho_opt_true = zeros(param.rho_opt_size,4);
 param.rho_opt_true(:,1) = [param.lc];
