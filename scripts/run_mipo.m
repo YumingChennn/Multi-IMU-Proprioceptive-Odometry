@@ -174,7 +174,7 @@ for idx=total_start_idx:total_end_idx
             seg_mes = y((i-1)*num_meas+7:(i-1)*num_meas+9);
             seg_S = S((i-1)*num_meas+7:(i-1)*num_meas+9,(i-1)*num_meas+7:(i-1)*num_meas+9);
             MD = sqrt(seg_mes'*inv(seg_S)*seg_mes);
-            if MD > 4
+            if MD > 3
                 mask((i-1)*num_meas+7:(i-1)*num_meas+9) = zeros(3,1);
             end
         end

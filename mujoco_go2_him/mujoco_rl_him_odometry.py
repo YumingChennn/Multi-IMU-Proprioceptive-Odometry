@@ -225,55 +225,19 @@ from scipy.spatial.transform import Rotation as R
 
 class MIPOFilter:
     def __init__(self, config):
-        # State: [pos(3), vel(3), euler(3), foot_pos(12), foot_vel(12), 
-        #         ba(3), bg(3), foot_ba(12), contact(1)]
-        self.x = np.zeros(self.state_size)
-        self.P = np.eye(self.state_size) * config.get('init_cov', 0.1)
-        self.P[34:52, 34:52] = np.eye(18) * config.get('init_bias_cov', 1e-4)
+        # MIPO parameters (對應 MATLAB 的 param)
+        self.mipo_use_foot_ang_contact_model = config.get('mipo_use_foot_ang_contact_model', 1)  # 1 = use foot gyro model, 0 = use zero velocity model
+
+        self.mipo_conf_init()
         
         # Config
         self.config = config
         self.gravity = np.array([0, 0, -9.81])
         
-        # MIPO parameters (對應 MATLAB 的 param)
-        self.mipo_use_foot_ang_contact_model = config.get('mipo_use_foot_ang_contact_model', 1)  # 1 = use foot gyro model, 0 = use zero velocity model
-        
         # Load Pinocchio model once
         urdf_path = "/home/ray/Multi-IMU-Proprioceptive-Odometry/mujoco_go2_him/urdf/go2.urdf"
         self.pin_model = pinocchio.buildModelFromUrdf(urdf_path)
         self.pin_data = self.pin_model.createData()
-        
-        # Define foot frame names for Go2 robot (adjust based on your URDF)
-        self.foot_frame_names = [
-            "FL_foot",  # Front Left
-            "FR_foot",  # Front Right
-            "RL_foot",  # Rear Left
-            "RR_foot"   # Rear Right
-        ]
-        
-        # Get frame IDs
-        self.foot_frame_ids = []
-        for name in self.foot_frame_names:
-            if self.pin_model.existFrame(name):
-                self.foot_frame_ids.append(self.pin_model.getFrameId(name))
-            else:
-                print(f"Warning: Frame {name} not found in URDF. Trying alternative names...")
-                # Try alternative naming conventions
-                alt_names = [
-                    f"{name.lower()}",
-                    f"{name.replace('_', '')}",
-                    name.replace("_foot", "_lower")
-                ]
-                found = False
-                for alt_name in alt_names:
-                    if self.pin_model.existFrame(alt_name):
-                        self.foot_frame_ids.append(self.pin_model.getFrameId(alt_name))
-                        print(f"  Found alternative: {alt_name}")
-                        found = True
-                        break
-                if not found:
-                    print(f"  Using None for {name}")
-                    self.foot_frame_ids.append(None)
         
         # Define joint indices for each leg (3 joints per leg)
         # Go2 robot joint order: FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf, ...
@@ -283,9 +247,6 @@ class MIPOFilter:
             2: [6, 7, 8],    # RL
             3: [9, 10, 11]   # RR
         }
-        
-        # Initialize CasADi symbolic functions
-        self.mipo_conf_init()
         
     def mipo_conf_init(self):
         """
@@ -352,11 +313,16 @@ class MIPOFilter:
             0               # time tk (52) - not used in KF
         ])
 
-        # Control noise Q2: gyro(3) + acc(3) + foot_acc(12) + hk(1) = 19 (dt is separate parameter)
+        # Control noise Q2: gyro(3) + acc(3) + foot_acc(12) + hk(1) = 19
+        # Note: This will be updated with dt multiplication in update_control_noise()
+        # MATLAB order: gyro(3), acc(3), foot1_acc(3), foot2_acc(3), foot3_acc(3), foot4_acc(3), hk(1)
         self.Q2 = np.diag([
             *[1e-4]*3,   # body gyro noise
             *[1e-4]*3,   # body acc noise
-            *[1e-4]*12,  # foot acc noise (4 feet × 3 axes)
+            *[1e-4]*3,   # foot1 acc noise
+            *[1e-4]*3,   # foot2 acc noise
+            *[1e-4]*3,   # foot3 acc noise
+            *[1e-4]*3,   # foot4 acc noise
             0,           # hk (no noise)
         ])
 
@@ -429,6 +395,28 @@ class MIPOFilter:
                      [ 0,  1,  0]])
         ] 
 
+    def initialize_state(self, init_pos, init_euler, foot_positions):
+        """Initialize filter state"""
+        # State: [pos(3), vel(3), euler(3), foot_pos(12), foot_vel(12), 
+        #         ba(3), bg(3), foot_ba(12), contact(1)]
+        self.x = np.zeros(self.state_size)
+
+        self.x[0:3] = init_pos     # position
+        self.x[3:6] = np.zeros(3)  # velocity
+        self.x[6:9] = init_euler   # orientation (euler)
+        self.x[9:21] = foot_positions.flatten()  # 4 feet * 3
+        self.x[21:33] = np.zeros(12)  # foot velocities
+        self.x[33:36] = np.zeros(3)  # biases
+        self.x[36:39] = np.zeros(3)  # biases
+        self.x[39:42] = np.zeros(3)  # biases
+        self.x[42:45] = np.zeros(3)  # biases
+        self.x[45:48] = np.zeros(3)  # biases
+        self.x[48:51] = np.zeros(3)  # biases
+        self.x[51:52] = np.zeros(1)
+
+        self.P = np.eye(self.state_size) * self.config.get('init_cov', 0.1)
+        self.P[34:52, 34:52] = np.eye(18) * self.config.get('init_bias_cov', 1e-4)
+
     def transform_foot_imu_to_body(self, joint_angles, gyro_feet_raw, acc_feet_raw):
         """
         Transform foot IMU measurements from IMU frame to body frame
@@ -473,6 +461,7 @@ class MIPOFilter:
     def get_foot_rotation(self, angles, leg_id):
         """
         計算足部中心相對於機體的旋轉矩陣
+        對應 MATLAB 的 autoFunc_fk_pf_rot
         
         Args:
             angles: Joint angles [hip, thigh, calf] (3,)
@@ -480,71 +469,29 @@ class MIPOFilter:
             
         Returns:
             R_bf: Rotation matrix from body frame to foot center frame (3x3)
+            
+        MATLAB equivalent:
+            R_bf = autoFunc_fk_pf_rot(angles, lc, rho_fix)
         """
-        if self.foot_frame_ids[leg_id] is None:
-            return np.eye(3)
+        # Extract joint angles
+        t1, t2, t3 = angles[0], angles[1], angles[2]
         
-        # Create full configuration vector
-        q = np.zeros(self.pin_model.nq)
-        joint_indices = self.leg_joint_indices[leg_id]
-        q[joint_indices] = angles
+        # Precompute trig functions (matching MATLAB)
+        t5 = np.cos(t1)
+        t6 = np.sin(t1)
+        t7 = t2 + t3
+        t8 = np.cos(t7)
+        t9 = np.sin(t7)
         
-        # Compute forward kinematics
-        pinocchio.forwardKinematics(self.pin_model, self.pin_data, q)
-        pinocchio.updateFramePlacements(self.pin_model, self.pin_data)
-        
-        # Get foot rotation in body frame
-        foot_frame_id = self.foot_frame_ids[leg_id]
-        R_bf = self.pin_data.oMf[foot_frame_id].rotation
+        # MATLAB formula: R_bf = reshape([t8,t6.*t9,-t5.*t9,0.0,t5,t6,t9,-t6.*t8,t5.*t8],[3,3])
+        # reshape fills column by column in MATLAB
+        R_bf = np.array([
+            [t8,      0.0,  t9     ],
+            [t6*t9,   t5,   -t6*t8 ],
+            [-t5*t9,  t6,   t5*t8  ]
+        ])
         
         return R_bf
-    
-    def initialize_state(self, init_pos, init_euler, foot_positions):
-        """Initialize filter state"""
-        self.x[0:3] = init_pos     # position
-        self.x[3:6] = np.zeros(3)  # velocity
-        self.x[6:9] = init_euler   # orientation (euler)
-        self.x[9:21] = foot_positions.flatten()  # 4 feet * 3
-        self.x[21:33] = np.zeros(12)  # foot velocities
-        self.x[33:36] = np.zeros(3)  # biases
-        self.x[36:39] = np.zeros(3)  # biases
-        self.x[39:42] = np.zeros(3)  # biases
-        self.x[42:45] = np.zeros(3)  # biases
-        self.x[45:48] = np.zeros(3)  # biases
-        self.x[48:51] = np.zeros(3)  # biases
-        self.x[51:52] = np.zeros(1)
-        
-    def state_transition(self, x, u_k, u_k1, dt):
-        """
-        State transition function f(x, u) - using CasADi for efficiency
-        x: current state
-        u_k: [gyro_body(3), acc_body(3), acc_feet(12), hk(1)] (19 dims)
-        u_k1: next timestep control
-        """
-        # Use CasADi function for state transition
-        x_new = self.f_casadi(x, u_k, u_k1, dt).full().flatten()
-        return x_new
-    
-    def measurement_model(self, x, wk, joint_angles, joint_vels, yawk, gyro_feet):
-        """
-        Measurement model h(x) - NumPy version
-        對應 MATLAB 的 mipo_measurement
-        
-        Args:
-            x: State (52,)
-            wk: Body angular velocity (3,)
-            joint_angles: Joint angles (12,)
-            joint_vels: Joint velocities (12,)
-            yawk: Yaw measurement (scalar)
-            gyro_feet: Foot gyro measurements (12,)
-            
-        Returns: Measurement residuals (41,)
-        """
-        # Note: This NumPy version is for reference/debugging
-        # The actual filter uses the CasADi version via h_casadi
-        # For now, just call the CasADi version and convert to NumPy
-        y_casadi = self.h_casadi(x, wk, joint_angles, joint_vels, yawk, gyro_feet)
-        return np.array(y_casadi.full()).flatten()
     
     def predict(self, u_k, u_k1, dt):
         """EKF Prediction step"""
@@ -560,59 +507,51 @@ class MIPOFilter:
         # Update process noise based on dt
         self.update_process_noise(dt)
         
+        # Update control noise based on dt (matching MATLAB)
+        self.update_control_noise(dt)
+        
         # Covariance prediction
         P_pred = F @ self.P @ F.T + self.Q1 + B @ self.Q2 @ B.T
         P_pred = (P_pred + P_pred.T) / 2  # Ensure symmetry
         
         return x_pred, P_pred
     
-    def update(self, x_pred, P_pred, wk, joint_angles, joint_vels, yawk, gyro_feet, contact_flags):
-        """EKF Update step
+    def state_transition(self, x, u_k, u_k1, dt):
+        """
+        State transition function f(x, u) - using CasADi for efficiency
+        x: current state
+        u_k: [gyro_body(3), acc_body(3), acc_feet(12), hk(1)] (19 dims)
+        u_k1: next timestep control
+        """
+        # Use CasADi function for state transition
+        x_new = self.f_casadi(x, u_k, u_k1, dt).full().flatten()
+        return x_new
+    
+    def compute_F_jacobian(self, x, u_k, u_k1, dt):
+        """Compute state transition Jacobian using CasADi automatic differentiation"""
+        # Use CasADi automatic differentiation
+        F = self.F_jac_casadi(x, u_k, u_k1, dt).full()
+        return F
+    
+    def compute_B_jacobian(self, x, u_k, u_k1, dt):
+        """
+        Compute control Jacobian using CasADi automatic differentiation
+        
+        B = ∂f/∂u where u = [gyro(3), acc(3), foot_acc(12), hk(1)]
         
         Args:
-            x_pred: Predicted state
-            P_pred: Predicted covariance
-            wk: Body angular velocity (3,)
-            joint_angles: Joint angles (12,)
-            joint_vels: Joint velocities (12,)
-            yawk: Yaw measurement (scalar)
-            gyro_feet: Foot gyro measurements (12,)
-            contact_flags: Contact flags (4,)
+            x: Current state (52,)
+            u_k: Current control input (19,) - [gyro(3), acc(3), foot_acc(12), hk(1)]
+            u_k1: Next control input (19,)
+            dt: Time step (separate parameter, not in u_k)
+            
+        Returns:
+            B: Control Jacobian (52, 19)
         """
-        # Update measurement noise based on contact
-        self.update_measurement_noise(contact_flags)
-        
-        # Predicted measurement
-        y_pred = self.measurement_model(x_pred, wk, joint_angles, joint_vels, yawk, gyro_feet)
-        
-        # Measurement Jacobian
-        H = self.compute_H_jacobian(x_pred, wk, joint_angles, joint_vels, yawk, gyro_feet)
-        
-        # Innovation covariance
-        S = H @ P_pred @ H.T + self.R
-        
-        # Actual measurement (from sensors)
-        y_actual = np.zeros(self.meas_size)
-        # Fill y_actual based on actual sensor readings...
-        
-        # Innovation
-        innovation = y_actual - y_pred
-        
-        # Mahalanobis distance test (optional outlier rejection)
-        mask = self.mahalanobis_test(innovation, S, contact_flags)
-        
-        # Kalman gain
-        H_masked = H[mask, :]
-        S_masked = S[np.ix_(mask, mask)]
-        K = P_pred @ H_masked.T @ np.linalg.inv(S_masked)
-        
-        # State update
-        self.x = x_pred + K @ innovation[mask]
-        
-        # Covariance update
-        self.P = (np.eye(self.state_size) - K @ H_masked) @ P_pred
-        self.P = (self.P + self.P.T) / 2
-        
+        # Use CasADi automatic differentiation
+        B = self.B_jac_casadi(x, u_k, u_k1, dt).full()
+        return B
+    
     def update_process_noise(self, dt):
         """Update Q1 based on dt - matching MATLAB exactly"""
         cfg = self.config
@@ -654,26 +593,127 @@ class MIPOFilter:
         q1_diag.append(0)
         
         self.Q1 = np.diag(q1_diag)
-        
-    def update_measurement_noise(self, contact_flags):
-        """Update R based on contact flags - matching MATLAB exactly"""
-        cfg = self.config
-        # MATLAB: meas_per_leg = 11, uses indices (i-1)*11+7:(i-1)*11+9 for zero vel
-        # and (i-1)*11+10 for height
-        # In Python 0-indexed: each leg has 11 slots (0-10, where 10 is reserved)
-        # Zero vel: indices 6:9 (MATLAB 7:9)
-        # Height: index 9 (MATLAB 10)
-        for i in range(4):
-            contact_penalty = 1.0 + (1.0 - contact_flags[i]) * 1e5
-            # Zero velocity constraint: MATLAB (i-1)*11+7:(i-1)*11+9
-            idx_vel_start = i * self.meas_per_leg + 6  # Python 0-indexed
-            self.R[idx_vel_start:idx_vel_start+3, idx_vel_start:idx_vel_start+3] = \
-                contact_penalty * cfg['meas_n_zero_vel'] * np.eye(3)
-            # Foot height constraint: MATLAB (i-1)*11+10
-            idx_height = i * self.meas_per_leg + 9  # Python 0-indexed
-            self.R[idx_height, idx_height] = contact_penalty * cfg['meas_n_foot_height']
     
-    def mahalanobis_test(self, innovation, S, contact_flags, threshold=5.0):
+    def update_control_noise(self, dt):
+        """Update Q2 based on dt - matching MATLAB exactly"""
+        cfg = self.config
+        
+        # Build Q2 diagonal matching MATLAB structure
+        # MATLAB order: acc(3), gyro(3), foot1_acc(3), foot2_acc(3), foot3_acc(3), foot4_acc(3), hk(1)
+        # Note: MATLAB uses [ctrl_n_acc, ctrl_n_gyro, ctrl_n_foot1_acc, ...]
+        q2_diag = []
+        
+        # Body control noise
+        q2_diag.extend([cfg['ctrl_n_gyro'] * dt] * 3)  # body gyro
+        q2_diag.extend([cfg['ctrl_n_acc'] * dt] * 3)   # body acc
+        
+        # Foot accelerometer noise
+        q2_diag.extend([cfg['ctrl_n_foot1_acc'] * dt] * 3)  # foot1 acc
+        q2_diag.extend([cfg['ctrl_n_foot2_acc'] * dt] * 3)  # foot2 acc
+        q2_diag.extend([cfg['ctrl_n_foot3_acc'] * dt] * 3)  # foot3 acc
+        q2_diag.extend([cfg['ctrl_n_foot4_acc'] * dt] * 3)  # foot4 acc
+        
+        # hk (no noise)
+        q2_diag.append(0)
+        
+        self.Q2 = np.diag(q2_diag)
+      
+    def update(self, x_pred, P_pred, wk, joint_angles, joint_vels, yawk, gyro_feet, contact_flags):
+        """EKF Update step
+        
+        Args:
+            x_pred: Predicted state
+            P_pred: Predicted covariance
+            wk: Body angular velocity (3,)
+            joint_angles: Joint angles (12,)
+            joint_vels: Joint velocities (12,)
+            yawk: Yaw measurement (scalar)
+            gyro_feet: Foot gyro measurements (12,)
+            contact_flags: Contact flags (4,)
+        """
+
+        # Predicted measurement
+        y_pred = self.measurement_model(x_pred, wk, joint_angles, joint_vels, yawk, gyro_feet)
+        
+        # Measurement Jacobian
+        H = self.compute_H_jacobian(x_pred, wk, joint_angles, joint_vels, yawk, gyro_feet)
+        
+        # Innovation covariance
+        S = H @ P_pred @ H.T + self.R
+        
+        # Measurement residual y (MATLAB已經計算好residual)
+        # MATLAB: y = full(mipo_conf.r(x01, hat_wk, hat_phik, hat_dphik, hat_yawk, gyro_IMU_bs))
+        # Note: measurement_model已經返回殘差，不是預測值
+        y = y_pred  # 實際上是residual
+        
+        # Mahalanobis distance test (outlier rejection)
+        # MATLAB: mask = ones(meas_size,1); then set mask=0 if MD > 4
+        mask = self.mahalanobis_test(y, S, contact_flags)
+        
+        # Kalman gain computation
+        # MATLAB: update = P01 * H(mask,:)' * (S(mask,mask)\y(mask))
+        H_masked = H[mask, :]
+        S_masked = S[np.ix_(mask, mask)]
+        y_masked = y[mask]
+        
+        K_masked = P_pred @ H_masked.T @ np.linalg.inv(S_masked)
+        update = K_masked @ y_masked
+        
+        # State update
+        # MATLAB: x_list(:,k+1) = x01 - update
+        # 注意：用減號，因為y已經是residual (prediction - actual)
+        self.x = x_pred - update
+        
+        # Covariance update (Joseph form - numerically stable)
+        # MATLAB: cov = (eye(state_size) - P01*H(mask,:)'*(S(mask,mask)\H(mask,:))) * P01
+        # 展開：(I - P_pred @ H_masked.T @ inv(S_masked) @ H_masked) @ P_pred
+        # 簡化：(I - K_masked @ H_masked) @ P_pred，其中 K_masked = P_pred @ H_masked.T @ inv(S_masked)
+        IKH = np.eye(self.state_size) - K_masked @ H_masked
+        self.P = IKH @ P_pred
+        
+        # Ensure symmetry
+        # MATLAB: cov_list(:,:,k+1) = (cov_list(:,:,k+1) + cov_list(:,:,k+1)')/2
+        self.P = (self.P + self.P.T) / 2
+
+    def measurement_model(self, x, wk, joint_angles, joint_vels, yawk, gyro_feet):
+        """
+        Measurement model h(x) - NumPy version
+        對應 MATLAB 的 mipo_measurement
+        
+        Args:
+            x: State (52,)
+            wk: Body angular velocity (3,)
+            joint_angles: Joint angles (12,)
+            joint_vels: Joint velocities (12,)
+            yawk: Yaw measurement (scalar)
+            gyro_feet: Foot gyro measurements (12,)
+            
+        Returns: Measurement residuals (41,)
+        """
+        # Note: This NumPy version is for reference/debugging
+        # The actual filter uses the CasADi version via h_casadi
+        # For now, just call the CasADi version and convert to NumPy
+        y_casadi = self.h_casadi(x, wk, joint_angles, joint_vels, yawk, gyro_feet)
+        return np.array(y_casadi.full()).flatten()
+
+    def compute_H_jacobian(self, x, wk, joint_angles, joint_vels, yawk, gyro_feet):
+        """
+        Compute measurement Jacobian using CasADi automatic differentiation
+        對應 MATLAB 的 kf_conf.dr
+        
+        Args:
+            x: State (52,)
+            wk: Body angular velocity (3,)
+            joint_angles: Joint angles (12,)
+            joint_vels: Joint velocities (12,)
+            yawk: Yaw measurement (1,)
+            gyro_feet: Foot gyro measurements (12,)
+        """
+        # 使用 CasADi 自動微分（快速且精確）
+        H = self.H_jac_casadi(x, wk, joint_angles, joint_vels, yawk, gyro_feet).full()
+        return H
+    
+    def mahalanobis_test(self, innovation, S, contact_flags, threshold=3.0):
         """Mahalanobis distance test for outlier rejection - matching MATLAB"""
         mask = np.ones(len(innovation), dtype=bool)
         
@@ -894,6 +934,50 @@ class MIPOFilter:
         # Combined rotation: R = Rz * Ry * Rx
         return ca.mtimes([R_z, R_y, R_x])
    
+    @staticmethod
+    def euler_to_rot(euler):
+        """
+        Convert euler angles to rotation matrix (NumPy version)
+        Matches CasADi version: R = Rz * Ry * Rx
+        
+        Args:
+            euler: [roll, pitch, yaw] (3,)
+            
+        Returns:
+            R: 3×3 rotation matrix (NumPy)
+        """
+        roll, pitch, yaw = euler[0], euler[1], euler[2]
+        
+        # Roll (rotation around X-axis)
+        cr = np.cos(roll)
+        sr = np.sin(roll)
+        R_x = np.array([
+            [1, 0, 0],
+            [0, cr, -sr],
+            [0, sr, cr]
+        ])
+        
+        # Pitch (rotation around Y-axis)
+        cp = np.cos(pitch)
+        sp = np.sin(pitch)
+        R_y = np.array([
+            [cp, 0, sp],
+            [0, 1, 0],
+            [-sp, 0, cp]
+        ])
+        
+        # Yaw (rotation around Z-axis)
+        cy = np.cos(yaw)
+        sy = np.sin(yaw)
+        R_z = np.array([
+            [cy, -sy, 0],
+            [sy, cy, 0],
+            [0, 0, 1]
+        ])
+        
+        # Combined rotation: R = Rz * Ry * Rx (matching CasADi version)
+        return R_z @ R_y @ R_x
+    
     def _measurement_model_casadi(self, x, wk, joint_angles, joint_vels, yawk, gyro_feet):
         """
         Measurement model using CasADi symbolic expressions
@@ -1163,39 +1247,6 @@ class MIPOFilter:
             ca.horzcat(-v[1], v[0], 0)
         )
     
-    @staticmethod
-    def _integrate_euler_casadi(euler, omega, dt):
-        """Integrate euler angles using CasADi"""
-        roll, pitch, yaw = euler[0], euler[1], euler[2]
-        
-        # Euler angle derivative matrix
-        cr = ca.cos(roll)
-        sr = ca.sin(roll)
-        cp = ca.cos(pitch)
-        tp = ca.tan(pitch)
-        
-        # Transformation matrix from body rates to Euler rates
-        T = ca.vertcat(
-            ca.horzcat(1, sr*tp, cr*tp),
-            ca.horzcat(0, cr, -sr),
-            ca.horzcat(0, sr/cp, cr/cp)
-        )
-        
-        euler_dot = ca.mtimes(T, omega)
-        return euler + euler_dot * dt
-    
-    @staticmethod
-    def euler_to_rot(euler):
-        """Convert euler angles to rotation matrix (NumPy version for non-symbolic ops)"""
-        return R.from_euler('xyz', euler).as_matrix()
-    
-    @staticmethod
-    def integrate_euler(euler, omega, dt):
-        """Integrate euler angles"""
-        r = R.from_euler('xyz', euler)
-        omega_quat = R.from_rotvec(omega * dt)
-        return (r * omega_quat).as_euler('xyz')
-    
     def forward_kinematics(self, angles, leg_id):
         """
         Compute foot position from joint angles using exact MATLAB formula
@@ -1235,85 +1286,6 @@ class MIPOFilter:
         
         return np.array([x_bf, y_bf, z_bf])
     
-    def forward_kinematics_vel(self, angles, ang_vels, leg_id):
-        """
-        Compute foot velocity from joint angles and velocities using Pinocchio
-        
-        Args:
-            angles: Joint angles for one leg [hip, thigh, calf] (3,)
-            ang_vels: Joint velocities for one leg [hip, thigh, calf] (3,)
-            leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
-            
-        Returns:
-            foot_vel: Foot velocity in body frame (3,)
-        """
-        if self.foot_frame_ids[leg_id] is None:
-            print(f"Warning: Foot frame for leg {leg_id} not found, returning zeros")
-            return np.zeros(3)
-        
-        # Create full configuration and velocity vectors
-        q = np.zeros(self.pin_model.nq)
-        v = np.zeros(self.pin_model.nv)
-        
-        # Set the joint angles and velocities for this leg
-        joint_indices = self.leg_joint_indices[leg_id]
-        q[joint_indices] = angles
-        v[joint_indices] = ang_vels
-        
-        # Compute forward kinematics with velocities
-        pinocchio.forwardKinematics(self.pin_model, self.pin_data, q, v)
-        pinocchio.updateFramePlacements(self.pin_model, self.pin_data)
-        
-        # Get foot velocity in body frame
-        foot_frame_id = self.foot_frame_ids[leg_id]
-        foot_velocity = pinocchio.getFrameVelocity(
-            self.pin_model, self.pin_data, foot_frame_id, pinocchio.ReferenceFrame.LOCAL_WORLD_ALIGNED
-        )
-        
-        # Return only linear velocity (first 3 components)
-        return foot_velocity.linear
-    
-    def compute_F_jacobian(self, x, u_k, u_k1, dt):
-        """Compute state transition Jacobian using CasADi automatic differentiation"""
-        # Use CasADi automatic differentiation
-        F = self.F_jac_casadi(x, u_k, u_k1, dt).full()
-        return F
-    
-    def compute_B_jacobian(self, x, u_k, u_k1, dt):
-        """
-        Compute control Jacobian using CasADi automatic differentiation
-        
-        B = ∂f/∂u where u = [gyro(3), acc(3), foot_acc(12), hk(1)]
-        
-        Args:
-            x: Current state (52,)
-            u_k: Current control input (19,) - [gyro(3), acc(3), foot_acc(12), hk(1)]
-            u_k1: Next control input (19,)
-            dt: Time step (separate parameter, not in u_k)
-            
-        Returns:
-            B: Control Jacobian (52, 19)
-        """
-        # Use CasADi automatic differentiation
-        B = self.B_jac_casadi(x, u_k, u_k1, dt).full()
-        return B
-    
-    def compute_H_jacobian(self, x, wk, joint_angles, joint_vels, yawk, gyro_feet):
-        """
-        Compute measurement Jacobian using CasADi automatic differentiation
-        對應 MATLAB 的 kf_conf.dr
-        
-        Args:
-            x: State (52,)
-            wk: Body angular velocity (3,)
-            joint_angles: Joint angles (12,)
-            joint_vels: Joint velocities (12,)
-            yawk: Yaw measurement (1,)
-            gyro_feet: Foot gyro measurements (12,)
-        """
-        # 使用 CasADi 自動微分（快速且精確）
-        H = self.H_jac_casadi(x, wk, joint_angles, joint_vels, yawk, gyro_feet).full()
-        return H
 
 if __name__ == "__main__":
     # Initialize ROS2
@@ -1389,17 +1361,18 @@ if __name__ == "__main__":
         'ctrl_n_foot4_acc': 1e-1,
         'meas_n_zero_vel': 0.01,
         'meas_n_foot_height': 0.001,
+        'mipo_use_foot_ang_contact_model': 1,
     }
     mipo = MIPOFilter(mipo_config)
 
-    # 在主循環外初始化
+    # Initialize MIPO state
     u_k_prev = None
 
     mujoco.mj_step(m, d)
 
     mocap_pos_body = d.sensordata[46:49].copy()
 
-    # 檢查 mocap 數據是否有效（非零或非 NaN）
+    # check mocap data validity
     if not np.all(mocap_pos_body == 0) and not np.any(np.isnan(mocap_pos_body)):
         init_pos = mocap_pos_body
         print(f"Using mocap initial position: {init_pos}")
@@ -1408,21 +1381,17 @@ if __name__ == "__main__":
         print(f"Using default initial position: {init_pos}")
     
     init_euler = np.zeros(3)
+    # Transform from body frame to world frame
+    R_wb = mipo.euler_to_rot(init_euler)
 
     actual_joint_angles = d.sensordata[:12]
     
     # Compute initial foot positions using forward kinematics
     init_foot_pos = np.zeros(12)
     for leg_id in range(4):
-        # 使用實際關節角度
         angles = actual_joint_angles[leg_id*3:(leg_id+1)*3]
-        _forward_kinematics_symbolic
         foot_pos_body = mipo.forward_kinematics(angles, leg_id)
-        
-        # Transform from body frame to world frame
-        R_wb = mipo.euler_to_rot(init_euler)
         foot_pos_world = R_wb @ foot_pos_body + init_pos
-        
         init_foot_pos[leg_id*3:(leg_id+1)*3] = foot_pos_world
     
     print(f"Initial foot positions computed: {init_foot_pos}")
@@ -1453,9 +1422,6 @@ if __name__ == "__main__":
     rr_acc_list = []
 
     counter = 0
-    # 在 main 函數開始添加
-    mipo_counter = 0
-    MIPO_DECIMATION = 1  # 每 10 個控制週期才更新一次 MIPO
 
     record_lists = {
         "frame_pos": frame_pos_data_list,
@@ -1513,48 +1479,44 @@ if __name__ == "__main__":
                     joint_angles, gyro_feet_raw, acc_feet_raw
                 )
                 
-                # 只在特定週期更新 MIPO
-                mipo_counter += 1
-                if mipo_counter % MIPO_DECIMATION == 0:
-                    # Calculate dt for MIPO update
-                    dt = simulation_dt * control_decimation * MIPO_DECIMATION
-                    
-                    # Prepare MIPO inputs (現在使用轉換後的值)
-                    u_k = np.concatenate([
-                        sensors["base_ang_vel"],  # gyro_body (已經在 body frame) (3)
-                        sensors["base_acc"],       # acc_body (已經在 body frame) (3)
-                        acc_feet_body,            # foot accelerations (轉換到 body frame) (12)
-                        [dt]                      # hk - time step (1)
-                    ])  # Total: 19 dimensions (dt is also passed as separate parameter to RK4)
-                    
-                    contact_flags = (foot_forces > 5.0).astype(float)
-                    # 使用線性外推預測 u_k1
-                    if u_k_prev is not None:
-                        u_k1 = 2 * u_k - u_k_prev  # 一階外推
-                    else:
-                        u_k1 = u_k.copy()  # 第一次還是用零階保持
-    
-                    # MIPO prediction and update (dt is passed as separate parameter)
-                    x_pred, P_pred = mipo.predict(u_k, u_k1, dt)
-                    
-                    joint_angles = sensors["qpos"]
-                    joint_vels = sensors["qvel"]
-                    
-                    # Extract wk (body angular velocity) and yawk (yaw from quaternion)
-                    wk = sensors["base_ang_vel"]  # Body angular velocity
-                    
-                    # Extract yaw from quaternion
-                    quat = sensors["base_quat"]  # [w, x, y, z]
-                    euler_from_quat = R.from_quat([quat[1], quat[2], quat[3], quat[0]]).as_euler('xyz')
-                    yawk = euler_from_quat[2]  # Yaw angle
-                    
-                    # Use transformed gyro data (in body frame)
-                    mipo.update(x_pred, P_pred, wk, joint_angles, joint_vels, yawk, gyro_feet_body, contact_flags)
-                    
-                    # Record MIPO estimates
-                    mipo_pos_list.append(mipo.x[0:3].copy())
-                    mipo_vel_list.append(mipo.x[3:6].copy())
-                    u_k_prev = u_k.copy()
+                dt = simulation_dt * control_decimation
+                
+                # Prepare MIPO inputs (現在使用轉換後的值)
+                u_k1 = np.concatenate([
+                    sensors["base_ang_vel"],  # gyro_body (已經在 body frame) (3)
+                    sensors["base_acc"],       # acc_body (已經在 body frame) (3)
+                    acc_feet_body,            # foot accelerations (轉換到 body frame) (12)
+                    [dt]                      # hk - time step (1)
+                ])  # Total: 19 dimensions (dt is also passed as separate parameter to RK4)
+                
+                contact_flags = (foot_forces > 5.0).astype(float)
+                
+                if u_k_prev is not None:
+                    u_k = u_k_prev  
+                else:
+                    u_k = u_k1.copy()  # 第一次還是用零階保持
+
+                # MIPO prediction and update (dt is passed as separate parameter)
+                x_pred, P_pred = mipo.predict(u_k, u_k1, dt)
+                
+                joint_angles = sensors["qpos"]
+                joint_vels = sensors["qvel"]
+                
+                # Extract wk (body angular velocity) and yawk (yaw from quaternion)
+                wk = sensors["base_ang_vel"]  # Body angular velocity
+                
+                # Extract yaw from quaternion
+                quat = sensors["mocap_quat_body"]  # [w, x, y, z]
+                euler_from_quat = R.from_quat([quat[1], quat[2], quat[3], quat[0]]).as_euler('xyz')
+                yawk = euler_from_quat[2]  # Yaw angle
+                
+                # Use transformed gyro data (in body frame)
+                mipo.update(x_pred, P_pred, wk, joint_angles, joint_vels, yawk, gyro_feet_body, contact_flags)
+                
+                # Record MIPO estimates
+                mipo_pos_list.append(mipo.x[0:3].copy())
+                mipo_vel_list.append(mipo.x[3:6].copy())
+                u_k_prev = u_k1.copy()
                 
                 publish_ros(imu_publisher, sensors, foot_forces)
 

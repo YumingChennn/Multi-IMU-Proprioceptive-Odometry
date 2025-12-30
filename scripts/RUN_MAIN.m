@@ -11,7 +11,7 @@ disp('read rosbag');
 
 % file_path = ['/home/ray/Multi-IMU-Proprioceptive-Odometry/dataset/_2023-02-15-15-01-56.bag'] 
 
-file_path = ['/home/ray/Multi-IMU-Proprioceptive-Odometry/dataset/output_ros1_4.bag'] 
+file_path = ['/home/ray/Multi-IMU-Proprioceptive-Odometry/dataset/output_ros1_5.bag'] 
 
 param.fl_imu_topic = '/imu/data/fl';
 param.fr_imu_topic = '/imu/data/fr';
