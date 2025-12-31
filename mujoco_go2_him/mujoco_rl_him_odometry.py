@@ -225,13 +225,13 @@ from scipy.spatial.transform import Rotation as R
 
 class MIPOFilter:
     def __init__(self, config):
+        # config
+        self.config = config
         # MIPO parameters (對應 MATLAB 的 param)
-        self.mipo_use_foot_ang_contact_model = config.get('mipo_use_foot_ang_contact_model', 1)  # 1 = use foot gyro model, 0 = use zero velocity model
+        self.mipo_use_foot_ang_contact_model = self.config.get('mipo_use_foot_ang_contact_model', 1)  # 1 = use foot gyro model, 0 = use zero velocity model
 
         self.mipo_conf_init()
         
-        # Config
-        self.config = config
         self.gravity = np.array([0, 0, -9.81])
         
         # Load Pinocchio model once
@@ -327,7 +327,9 @@ class MIPOFilter:
         ])
 
         # Measurement noise
+        # MATLAB: kf_conf.R = 1e-2*eye(kf_conf.meas_size);
         self.R = 1e-2 * np.eye(self.meas_size)
+        # Will be properly set in _initialize_measurement_noise() based on mipo_use_md_test_flag
 
         """Setup CasADi symbolic functions for efficient computation"""
         # ========== Process Model ==========
@@ -509,10 +511,12 @@ class MIPOFilter:
         
         # Update control noise based on dt (matching MATLAB)
         self.update_control_noise(dt)
+
+        self._initialize_measurement_noise(dt)
         
         # Covariance prediction
         P_pred = F @ self.P @ F.T + self.Q1 + B @ self.Q2 @ B.T
-        P_pred = (P_pred + P_pred.T) / 2  # Ensure symmetry
+        # P_pred = (P_pred + P_pred.T) / 2  # Ensure symmetry
         
         return x_pred, P_pred
     
@@ -617,6 +621,35 @@ class MIPOFilter:
         q2_diag.append(0)
         
         self.Q2 = np.diag(q2_diag)
+    
+    def _initialize_measurement_noise(self, dt):
+        """Initialize R matrix matching MATLAB when mipo_use_md_test_flag=1
+        
+        MATLAB code:
+            for i = 1:param.num_leg
+                mipo_conf.R((i-1)*num_meas+7:(i-1)*num_meas+9,(i-1)*num_meas+7:(i-1)*num_meas+9) = 
+                    param.meas_n_zero_vel *eye(3);  % 0.01
+                mipo_conf.R((i-1)*num_meas+10,(i-1)*num_meas+10) = 
+                    param.meas_n_foot_height;  % 0.001
+            end
+        """
+        cfg = self.config
+        
+        # Keep R as 1e-2 * I for non-critical measurements (matching MATLAB initial value)
+        # Only update the critical measurements below
+        
+        # Set measurement noise for each leg
+        for i in range(4):  # 4 legs
+            # Zero velocity constraint: indices 6:9 per leg (Python 0-indexed)
+            # MATLAB: (i-1)*11+7:(i-1)*11+9
+            idx_vel_start = i * self.meas_per_leg + 6
+            self.R[idx_vel_start:idx_vel_start+3, idx_vel_start:idx_vel_start+3] = \
+                cfg['meas_n_zero_vel'] * np.eye(3)  # 0.01 * I
+            
+            # Foot height constraint: index 9 per leg (Python 0-indexed)
+            # MATLAB: (i-1)*11+10
+            idx_height = i * self.meas_per_leg + 9
+            self.R[idx_height, idx_height] = cfg['meas_n_foot_height']  # 0.001
       
     def update(self, x_pred, P_pred, wk, joint_angles, joint_vels, yawk, gyro_feet, contact_flags):
         """EKF Update step
@@ -631,7 +664,7 @@ class MIPOFilter:
             gyro_feet: Foot gyro measurements (12,)
             contact_flags: Contact flags (4,)
         """
-
+        
         # Predicted measurement
         y_pred = self.measurement_model(x_pred, wk, joint_angles, joint_vels, yawk, gyro_feet)
         
@@ -664,12 +697,9 @@ class MIPOFilter:
         # 注意：用減號，因為y已經是residual (prediction - actual)
         self.x = x_pred - update
         
-        # Covariance update (Joseph form - numerically stable)
-        # MATLAB: cov = (eye(state_size) - P01*H(mask,:)'*(S(mask,mask)\H(mask,:))) * P01
-        # 展開：(I - P_pred @ H_masked.T @ inv(S_masked) @ H_masked) @ P_pred
-        # 簡化：(I - K_masked @ H_masked) @ P_pred，其中 K_masked = P_pred @ H_masked.T @ inv(S_masked)
-        IKH = np.eye(self.state_size) - K_masked @ H_masked
-        self.P = IKH @ P_pred
+        # Covariance update - matching MATLAB exactly
+        # MATLAB: cov_list(:,:,k+1) = (eye(state_size) - P01*H(mask,:)'*(S(mask,mask)\H(mask,:))) * P01
+        self.P = (np.eye(self.state_size) - P_pred @ H_masked.T @ np.linalg.inv(S_masked) @ H_masked) @ P_pred
         
         # Ensure symmetry
         # MATLAB: cov_list(:,:,k+1) = (cov_list(:,:,k+1) + cov_list(:,:,k+1)')/2
@@ -714,7 +744,13 @@ class MIPOFilter:
         return H
     
     def mahalanobis_test(self, innovation, S, contact_flags, threshold=3.0):
-        """Mahalanobis distance test for outlier rejection - matching MATLAB"""
+        """Mahalanobis distance test for outlier rejection - matching MATLAB (threshold=3)
+        
+        MATLAB code:
+            if MD > 3
+                mask((i-1)*num_meas+7:(i-1)*num_meas+9) = zeros(3,1);
+            end
+        """
         mask = np.ones(len(innovation), dtype=bool)
         
         # MATLAB: for i = 1:param.num_leg
@@ -729,7 +765,7 @@ class MIPOFilter:
             
             MD = np.sqrt(seg_innov.T @ np.linalg.inv(seg_S) @ seg_innov)
             if MD > threshold:
-                mask[idx_start:idx_end] = False
+                mask[idx_start:idx_end] = np.zeros(3, dtype=bool)  # Set to False for outlier rejection
                 
         return mask
     
@@ -1686,31 +1722,52 @@ if __name__ == "__main__":
     # Plot MIPO results
     mipo_pos_array = np.array(mipo_pos_list)
     frame_pos_array = np.array(frame_pos_data_list)
+    
+    # Figure 1: Position and Velocity vs Time
     plt.figure(figsize=(12, 8))
     
     plt.subplot(2, 1, 1)
-    plt.plot(mipo_pos_array[:, 0], label='X')
-    plt.plot(mipo_pos_array[:, 1], label='Y')
-    plt.plot(mipo_pos_array[:, 2], label='Z')
+    plt.plot(mipo_pos_array[:, 0], label='MIPO X')
+    plt.plot(mipo_pos_array[:, 1], label='MIPO Y')
+    plt.plot(mipo_pos_array[:, 2], label='MIPO Z')
     plt.plot(frame_pos_array[:, 0], '--', label='Frame X')
     plt.plot(frame_pos_array[:, 1], '--', label='Frame Y')
     plt.plot(frame_pos_array[:, 2], '--', label='Frame Z')
     plt.title('MIPO Estimated Position')
+    plt.xlabel('Time Step')
+    plt.ylabel('Position (m)')
     plt.legend()
     plt.grid(True)
     
     plt.subplot(2, 1, 2)
     mipo_vel_array = np.array(mipo_vel_list)
     frame_vel_array = np.array(frame_vel_data_list)
-    plt.plot(mipo_vel_array[:, 0], label='Vx')
-    plt.plot(mipo_vel_array[:, 1], label='Vy')
-    plt.plot(mipo_vel_array[:, 2], label='Vz')
+    plt.plot(mipo_vel_array[:, 0], label='MIPO Vx')
+    plt.plot(mipo_vel_array[:, 1], label='MIPO Vy')
+    plt.plot(mipo_vel_array[:, 2], label='MIPO Vz')
     plt.plot(frame_vel_array[:, 0], '--', label='Frame Vx')
     plt.plot(frame_vel_array[:, 1], '--', label='Frame Vy')
     plt.plot(frame_vel_array[:, 2], '--', label='Frame Vz')
     plt.title('MIPO Estimated Velocity')
+    plt.xlabel('Time Step')
+    plt.ylabel('Velocity (m/s)')
     plt.legend()
     plt.grid(True)
     
     plt.tight_layout()
+    
+    # Figure 2: XY Trajectory Comparison
+    plt.figure(figsize=(10, 10))
+    plt.plot(frame_pos_array[:, 0], frame_pos_array[:, 1], 'b-', linewidth=2, label='Ground Truth (Frame)')
+    plt.plot(mipo_pos_array[:, 0], mipo_pos_array[:, 1], 'r--', linewidth=2, label='MIPO Estimate')
+    plt.plot(frame_pos_array[0, 0], frame_pos_array[0, 1], 'go', markersize=10, label='Start')
+    plt.plot(frame_pos_array[-1, 0], frame_pos_array[-1, 1], 'rs', markersize=10, label='End')
+    plt.title('XY Trajectory Comparison', fontsize=14)
+    plt.xlabel('X Position (m)', fontsize=12)
+    plt.ylabel('Y Position (m)', fontsize=12)
+    plt.legend(fontsize=11)
+    plt.grid(True)
+    plt.axis('equal')
+    plt.tight_layout()
+    
     plt.show()
