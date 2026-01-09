@@ -16,6 +16,9 @@ from geometry_msgs.msg import PoseStamped
 from keyboard_controller import KeyboardController
 import pinocchio
 
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+
 # from gamepaded import gamepad_reader
 NUM_MOTOR = 12
 
@@ -220,9 +223,6 @@ class ImuPublisher(Node):
         
         self.publisher_joint_state.publish(msg)
 
-import numpy as np
-from scipy.spatial.transform import Rotation as R
-
 class MIPOFilter:
     def __init__(self, config):
         # config
@@ -230,14 +230,16 @@ class MIPOFilter:
         # MIPO parameters (對應 MATLAB 的 param)
         self.mipo_use_foot_ang_contact_model = self.config.get('mipo_use_foot_ang_contact_model', 1)  # 1 = use foot gyro model, 0 = use zero velocity model
 
-        self.mipo_conf_init()
-        
-        self.gravity = np.array([0, 0, -9.81])
-        
         # Load Pinocchio model once
         urdf_path = "/home/ray/Multi-IMU-Proprioceptive-Odometry/mujoco_go2_him/urdf/go2.urdf"
         self.pin_model = pinocchio.buildModelFromUrdf(urdf_path)
         self.pin_data = self.pin_model.createData()
+
+        self._extract_robot_parameters()
+        self._setup_casadi_kinematics()
+        self.mipo_conf_init()
+        
+        self.gravity = np.array([0, 0, -9.81])
         
         # Define joint indices for each leg (3 joints per leg)
         # Go2 robot joint order: FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf, ...
@@ -247,7 +249,109 @@ class MIPOFilter:
             2: [6, 7, 8],    # RL
             3: [9, 10, 11]   # RR
         }
+
+    def _extract_robot_parameters(self):
+        """從 Pinocchio model 自動提取機器人參數"""
         
+        # 定義腿部順序和對應的關節/frame名稱
+        leg_names = ['FL', 'FR', 'RL', 'RR']
+        
+        self.ox_list = []
+        self.oy_list = []
+        self.d_list = []
+        self.lt_list = []
+        self.lc_list = []
+   
+        for leg_name in leg_names:
+            # 1. 獲取 hip joint 的位置（相對於 base）
+            hip_joint_name = f"{leg_name}_hip_joint"
+            if self.pin_model.existJointName(hip_joint_name):
+                hip_joint_id = self.pin_model.getJointId(hip_joint_name)
+                # joint placement 是從 parent frame 到 joint frame 的變換
+                hip_placement = self.pin_model.jointPlacements[hip_joint_id]
+                self.ox_list.append(hip_placement.translation[0])  # X offset
+                self.oy_list.append(hip_placement.translation[1])  # Y offset
+            
+            # 2. 獲取 thigh joint 的位置（abad link length）
+            thigh_joint_name = f"{leg_name}_thigh_joint"
+            if self.pin_model.existJointName(thigh_joint_name):
+                thigh_joint_id = self.pin_model.getJointId(thigh_joint_name)
+                thigh_placement = self.pin_model.jointPlacements[thigh_joint_id]
+                self.d_list.append(thigh_placement.translation[1])  # Y offset (abad length)
+            
+            # 3. 獲取 calf joint 的位置（thigh length）
+            calf_joint_name = f"{leg_name}_calf_joint"
+            if self.pin_model.existJointName(calf_joint_name):
+                calf_joint_id = self.pin_model.getJointId(calf_joint_name)
+                calf_placement = self.pin_model.jointPlacements[calf_joint_id]
+                # Thigh length 通常在 Z 方向
+                lt = np.abs(calf_placement.translation[2])
+                self.lt_list.append(lt)
+            
+            # 4. 獲取 foot frame 的位置（calf length）
+            foot_frame_name = f"{leg_name}_foot"
+            if self.pin_model.existFrame(foot_frame_name):
+                foot_frame_id = self.pin_model.getFrameId(foot_frame_name)
+                # Frame placement 是相對於其 parent joint 的
+                foot_placement = self.pin_model.frames[foot_frame_id].placement
+                # Calf length 通常在 Z 方向
+                lc = np.abs(foot_placement.translation[2])
+                self.lc_list.append(lc)
+        
+        # 取平均值（左右腿對稱）
+        self.lt = np.mean(self.lt_list) if self.lt_list else 0.213
+        self.lc = np.mean(self.lc_list) if self.lc_list else 0.213
+        
+        print("Extracted robot parameters from URDF:")
+        print(f"  Hip offsets X: {self.ox_list}")
+        print(f"  Hip offsets Y: {self.oy_list}")
+        print(f"  Abad lengths: {self.d_list}")
+        print(f"  Thigh length: {self.lt:.4f}")
+        print(f"  Calf length: {self.lc:.4f}")
+
+    def _setup_casadi_kinematics(self):
+        """使用提取的參數設置 CasADi 符號運動學"""
+        
+        # 為每條腿創建 CasADi 函數
+        self.fk_casadi_funcs = []
+        self.jac_casadi_funcs = []
+        
+        for leg_id in range(4):
+            # 定義符號變量
+            q = ca.SX.sym('q', 3)  # 3個關節角度
+            
+            # 使用提取的參數構建解析 FK
+            ox = self.ox_list[leg_id]
+            oy = self.oy_list[leg_id]
+            d = self.d_list[leg_id]
+            lt = self.lt
+            lc = self.lc
+            
+            # 解析運動學方程（與之前相同，但參數來自 URDF）
+            q1, q2, q3 = q[0], q[1], q[2]
+            
+            s1, c1 = ca.sin(q1), ca.cos(q1)
+            s2, c2 = ca.sin(q2), ca.cos(q2)
+            s23, c23 = ca.sin(q2+q3), ca.cos(q2+q3)
+            
+            # FK 公式
+            x_bf = ox - lt*s2 - lc*s23
+            y_bf = oy + d*c1 + lt*c1*c2 + lc*c1*c23
+            z_bf = d*s1 + lt*s1*c2 + lc*s1*c23
+            
+            foot_pos = ca.vertcat(x_bf, y_bf, z_bf)
+            
+            # 創建 CasADi 函數
+            fk_func = ca.Function(f'fk_leg{leg_id}', [q], [foot_pos])
+            self.fk_casadi_funcs.append(fk_func)
+            
+            # 計算 Jacobian（自動微分）
+            jac = ca.jacobian(foot_pos, q)
+            jac_func = ca.Function(f'jac_leg{leg_id}', [q], [jac])
+            self.jac_casadi_funcs.append(jac_func)
+        
+        print("CasADi kinematics functions created successfully!")
+    
     def mipo_conf_init(self):
         """
         Multi-IMU Proprioceptive Odometry Filter
@@ -1135,137 +1239,137 @@ class MIPOFilter:
         # Total: 4 legs × 11 residuals + 1 yaw = 45 dimensions (matching MATLAB)
         return ca.vertcat(*residual_list)
     
-    def _forward_kinematics_symbolic(self, angles, leg_id):
-        """
-        符號版本的正向運動學 - 對應 MATLAB 的 autoFunc_fk_pf_pos
-        使用 Go2 機器人的實際運動學參數
+    # def _forward_kinematics_symbolic(self, angles, leg_id):
+    #     """
+    #     符號版本的正向運動學 - 對應 MATLAB 的 autoFunc_fk_pf_pos
+    #     使用 Go2 機器人的實際運動學參數
         
-        Args:
-            angles: Joint angles [hip, thigh, calf] (3,) - CasADi symbolic
-            leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
+    #     Args:
+    #         angles: Joint angles [hip, thigh, calf] (3,) - CasADi symbolic
+    #         leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
             
-        Returns:
-            foot_pos: Foot position in body frame (3,) - CasADi symbolic
+    #     Returns:
+    #         foot_pos: Foot position in body frame (3,) - CasADi symbolic
             
-        MATLAB equivalent:
-            p_bf = autoFunc_fk_pf_pos(angles, lc, rho_fix)
-            where rho_fix = [ox; oy; d; lt]
-        """
+    #     MATLAB equivalent:
+    #         p_bf = autoFunc_fk_pf_pos(angles, lc, rho_fix)
+    #         where rho_fix = [ox; oy; d; lt]
+    #     """
 
-        # Go2 robot parameters from URDF (對應 MATLAB 的 param)
-        # FL, FR, RL, RR
-        ox_list = [0.1934, 0.1934, -0.1934, -0.1934]   # Hip offset X
-        oy_list = [0.0465, -0.0465, 0.0465, -0.0465]   # Hip offset Y
-        d_list = [0.0955, -0.0955, 0.0955, -0.0955]     # Hip offset Z (abad link length)
+    #     # Go2 robot parameters from URDF (對應 MATLAB 的 param)
+    #     # FL, FR, RL, RR
+    #     ox_list = [0.1934, 0.1934, -0.1934, -0.1934]   # Hip offset X
+    #     oy_list = [0.0465, -0.0465, 0.0465, -0.0465]   # Hip offset Y
+    #     d_list = [0.0955, -0.0955, 0.0955, -0.0955]     # Hip offset Z (abad link length)
         
-        lt = 0.213  # Thigh length
-        lc = 0.213  # Calf length
+    #     lt = 0.213  # Thigh length
+    #     lc = 0.213  # Calf length
         
-        # Get parameters for this leg (對應 MATLAB 的 rho_fix(:,i))
-        ox = ox_list[leg_id]
-        oy = oy_list[leg_id]
-        d = d_list[leg_id]
+    #     # Get parameters for this leg (對應 MATLAB 的 rho_fix(:,i))
+    #     ox = ox_list[leg_id]
+    #     oy = oy_list[leg_id]
+    #     d = d_list[leg_id]
         
-        # MATLAB formula (符號數學工具箱生成的精確公式):
-        # p_bf = [ox-lt.*t9-lc.*sin(t2+t3);
-        #         oy+d.*t5+lt.*t6.*t8+lc.*t6.*t7.*t8-lc.*t8.*t9.*t10;
-        #         d.*t8-lt.*t5.*t6-lc.*t5.*t6.*t7+lc.*t5.*t9.*t10];
-        # where:
-        #   t5 = cos(t1), t6 = cos(t2), t7 = cos(t3)
-        #   t8 = sin(t1), t9 = sin(t2), t10 = sin(t3)
+    #     # MATLAB formula (符號數學工具箱生成的精確公式):
+    #     # p_bf = [ox-lt.*t9-lc.*sin(t2+t3);
+    #     #         oy+d.*t5+lt.*t6.*t8+lc.*t6.*t7.*t8-lc.*t8.*t9.*t10;
+    #     #         d.*t8-lt.*t5.*t6-lc.*t5.*t6.*t7+lc.*t5.*t9.*t10];
+    #     # where:
+    #     #   t5 = cos(t1), t6 = cos(t2), t7 = cos(t3)
+    #     #   t8 = sin(t1), t9 = sin(t2), t10 = sin(t3)
         
-        # Extract joint angles (對應 MATLAB 的 t1, t2, t3)
-        t1 = angles[0]  # hip angle
-        t2 = angles[1]  # thigh angle
-        t3 = angles[2]  # calf angle
-        t5 = ca.cos(t1)
-        t6 = ca.cos(t2)
-        t7 = ca.cos(t3)
-        t8 = ca.sin(t1)
-        t9 = ca.sin(t2)
-        t10 = ca.sin(t3)
+    #     # Extract joint angles (對應 MATLAB 的 t1, t2, t3)
+    #     t1 = angles[0]  # hip angle
+    #     t2 = angles[1]  # thigh angle
+    #     t3 = angles[2]  # calf angle
+    #     t5 = ca.cos(t1)
+    #     t6 = ca.cos(t2)
+    #     t7 = ca.cos(t3)
+    #     t8 = ca.sin(t1)
+    #     t9 = ca.sin(t2)
+    #     t10 = ca.sin(t3)
         
-        # Exact MATLAB formula
-        x_bf = ox - lt*t9 - lc*ca.sin(t2 + t3)
-        y_bf = oy + d*t5 + lt*t6*t8 + lc*t6*t7*t8 - lc*t8*t9*t10
-        z_bf = d*t8 - lt*t5*t6 - lc*t5*t6*t7 + lc*t5*t9*t10
+    #     # Exact MATLAB formula
+    #     x_bf = ox - lt*t9 - lc*ca.sin(t2 + t3)
+    #     y_bf = oy + d*t5 + lt*t6*t8 + lc*t6*t7*t8 - lc*t8*t9*t10
+    #     z_bf = d*t8 - lt*t5*t6 - lc*t5*t6*t7 + lc*t5*t9*t10
         
-        return ca.vertcat(x_bf, y_bf, z_bf)
+    #     return ca.vertcat(x_bf, y_bf, z_bf)
     
-    def _forward_kinematics_jacobian(self, angles, leg_id):
-        """
-        Jacobian of forward kinematics - 對應 MATLAB 的 autoFunc_d_fk_dt
-        使用 Go2 機器人的實際運動學參數
+    # def _forward_kinematics_jacobian(self, angles, leg_id):
+    #     """
+    #     Jacobian of forward kinematics - 對應 MATLAB 的 autoFunc_d_fk_dt
+    #     使用 Go2 機器人的實際運動學參數
         
-        Args:
-            angles: Joint angles [hip, thigh, calf] (3,) - CasADi symbolic
-            leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
+    #     Args:
+    #         angles: Joint angles [hip, thigh, calf] (3,) - CasADi symbolic
+    #         leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
             
-        Returns:
-            J: Jacobian matrix (3x3) - ∂p_bf/∂angles
+    #     Returns:
+    #         J: Jacobian matrix (3x3) - ∂p_bf/∂angles
             
-        MATLAB equivalent:
-            J = autoFunc_d_fk_dt(angles, lc, rho_fix)
-            where rho_fix = [ox; oy; d; lt]
-        """
-        # Go2 robot parameters from URDF
-        ox_list = [0.1934, 0.1934, -0.1934, -0.1934]
-        oy_list = [0.0465, -0.0465, 0.0465, -0.0465]
-        d_list = [0.0955, -0.0955, 0.0955, -0.0955]
+    #     MATLAB equivalent:
+    #         J = autoFunc_d_fk_dt(angles, lc, rho_fix)
+    #         where rho_fix = [ox; oy; d; lt]
+    #     """
+    #     # Go2 robot parameters from URDF
+    #     ox_list = [0.1934, 0.1934, -0.1934, -0.1934]
+    #     oy_list = [0.0465, -0.0465, 0.0465, -0.0465]
+    #     d_list = [0.0955, -0.0955, 0.0955, -0.0955]
         
-        lt = 0.213  # Thigh length
-        lc = 0.213  # Calf length
+    #     lt = 0.213  # Thigh length
+    #     lc = 0.213  # Calf length
         
-        # Get parameters for this leg
-        ox = ox_list[leg_id]
-        oy = oy_list[leg_id]
-        d = d_list[leg_id]
+    #     # Get parameters for this leg
+    #     ox = ox_list[leg_id]
+    #     oy = oy_list[leg_id]
+    #     d = d_list[leg_id]
         
-        # Extract joint angles
-        t1 = angles[0]  # hip angle
-        t2 = angles[1]  # thigh angle
-        t3 = angles[2]  # calf angle
+    #     # Extract joint angles
+    #     t1 = angles[0]  # hip angle
+    #     t2 = angles[1]  # thigh angle
+    #     t3 = angles[2]  # calf angle
         
-        # Precompute trig functions (matching MATLAB variable names)
-        t5 = ca.cos(t1)
-        t6 = ca.cos(t2)
-        t7 = ca.cos(t3)
-        t8 = ca.sin(t1)
-        t9 = ca.sin(t2)
-        t10 = ca.sin(t3)
-        t11 = t2 + t3
-        t12 = ca.cos(t11)
-        t13 = lt * t9
-        t14 = ca.sin(t11)
-        t15 = lc * t12
-        t16 = lc * t14
-        t17 = -t15
-        t18 = t13 + t16
+    #     # Precompute trig functions (matching MATLAB variable names)
+    #     t5 = ca.cos(t1)
+    #     t6 = ca.cos(t2)
+    #     t7 = ca.cos(t3)
+    #     t8 = ca.sin(t1)
+    #     t9 = ca.sin(t2)
+    #     t10 = ca.sin(t3)
+    #     t11 = t2 + t3
+    #     t12 = ca.cos(t11)
+    #     t13 = lt * t9
+    #     t14 = ca.sin(t11)
+    #     t15 = lc * t12
+    #     t16 = lc * t14
+    #     t17 = -t15
+    #     t18 = t13 + t16
         
-        # MATLAB formula: jacobian = reshape([...], [3,3])
-        # Column 1: ∂p_bf/∂t1
-        j11 = 0.0
-        j21 = -d*t8 + lt*t5*t6 + lc*t5*t6*t7 - lc*t5*t9*t10
-        j31 = d*t5 + lt*t6*t8 + lc*t6*t7*t8 - lc*t8*t9*t10
+    #     # MATLAB formula: jacobian = reshape([...], [3,3])
+    #     # Column 1: ∂p_bf/∂t1
+    #     j11 = 0.0
+    #     j21 = -d*t8 + lt*t5*t6 + lc*t5*t6*t7 - lc*t5*t9*t10
+    #     j31 = d*t5 + lt*t6*t8 + lc*t6*t7*t8 - lc*t8*t9*t10
         
-        # Column 2: ∂p_bf/∂t2
-        j12 = t17 - lt*t6
-        j22 = -t8*t18
-        j32 = t5*t18
+    #     # Column 2: ∂p_bf/∂t2
+    #     j12 = t17 - lt*t6
+    #     j22 = -t8*t18
+    #     j32 = t5*t18
         
-        # Column 3: ∂p_bf/∂t3
-        j13 = t17
-        j23 = -t8*t16
-        j33 = t5*t16
+    #     # Column 3: ∂p_bf/∂t3
+    #     j13 = t17
+    #     j23 = -t8*t16
+    #     j33 = t5*t16
         
-        # Construct Jacobian matrix (3x3)
-        J = ca.vertcat(
-            ca.horzcat(j11, j12, j13),
-            ca.horzcat(j21, j22, j23),
-            ca.horzcat(j31, j32, j33)
-        )
+    #     # Construct Jacobian matrix (3x3)
+    #     J = ca.vertcat(
+    #         ca.horzcat(j11, j12, j13),
+    #         ca.horzcat(j21, j22, j23),
+    #         ca.horzcat(j31, j32, j33)
+    #     )
         
-        return J
+    #     return J
     
     @staticmethod
     def _skew_symmetric(v):
@@ -1285,45 +1389,79 @@ class MIPOFilter:
             ca.horzcat(-v[1], v[0], 0)
         )
     
-    def forward_kinematics(self, angles, leg_id):
-        """
-        Compute foot position from joint angles using exact MATLAB formula
-        Replaces Pinocchio with analytical forward kinematics
+    # def forward_kinematics(self, angles, leg_id):
+    #     """
+    #     Compute foot position from joint angles using exact MATLAB formula
+    #     Replaces Pinocchio with analytical forward kinematics
         
-        Args:
-            angles: Joint angles for one leg [hip, thigh, calf] (3,)
-            leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
+    #     Args:
+    #         angles: Joint angles for one leg [hip, thigh, calf] (3,)
+    #         leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
             
-        Returns:
-            foot_pos: Foot position in body frame (3,) - NumPy array
-        """
-        # Go2 robot parameters (matching MATLAB)
-        ox_list = [0.1934, 0.1934, -0.1934, -0.1934]
-        oy_list = [0.0465, -0.0465, 0.0465, -0.0465]
-        d_list = [0.0955, -0.0955, 0.0955, -0.0955]
-        lt = 0.213
-        lc = 0.213
+    #     Returns:
+    #         foot_pos: Foot position in body frame (3,) - NumPy array
+    #     """
+    #     # Go2 robot parameters (matching MATLAB)
+    #     ox_list = [0.1934, 0.1934, -0.1934, -0.1934]
+    #     oy_list = [0.0465, -0.0465, 0.0465, -0.0465]
+    #     d_list = [0.0955, -0.0955, 0.0955, -0.0955]
+    #     lt = 0.213
+    #     lc = 0.213
         
-        ox = ox_list[leg_id]
-        oy = oy_list[leg_id]
-        d = d_list[leg_id]
+    #     ox = ox_list[leg_id]
+    #     oy = oy_list[leg_id]
+    #     d = d_list[leg_id]
         
-        # Extract joint angles
-        t1, t2, t3 = angles[0], angles[1], angles[2]
-        t5 = np.cos(t1)
-        t6 = np.cos(t2)
-        t7 = np.cos(t3)
-        t8 = np.sin(t1)
-        t9 = np.sin(t2)
-        t10 = np.sin(t3)
+    #     # Extract joint angles
+    #     t1, t2, t3 = angles[0], angles[1], angles[2]
+    #     t5 = np.cos(t1)
+    #     t6 = np.cos(t2)
+    #     t7 = np.cos(t3)
+    #     t8 = np.sin(t1)
+    #     t9 = np.sin(t2)
+    #     t10 = np.sin(t3)
         
-        # MATLAB formula from autoFunc_fk_pf_pos
-        x_bf = ox - lt*t9 - lc*np.sin(t2 + t3)
-        y_bf = oy + d*t5 + lt*t6*t8 + lc*t6*t7*t8 - lc*t8*t9*t10
-        z_bf = d*t8 - lt*t5*t6 - lc*t5*t6*t7 + lc*t5*t9*t10
+    #     # MATLAB formula from autoFunc_fk_pf_pos
+    #     x_bf = ox - lt*t9 - lc*np.sin(t2 + t3)
+    #     y_bf = oy + d*t5 + lt*t6*t8 + lc*t6*t7*t8 - lc*t8*t9*t10
+    #     z_bf = d*t8 - lt*t5*t6 - lc*t5*t6*t7 + lc*t5*t9*t10
         
-        return np.array([x_bf, y_bf, z_bf])
+    #     return np.array([x_bf, y_bf, z_bf])
     
+    def _forward_kinematics_symbolic(self, angles, leg_id):
+        """使用預編譯的 CasADi 函數（參數從 URDF 提取）"""
+        return self.fk_casadi_funcs[leg_id](angles)
+    
+    def _forward_kinematics_jacobian(self, angles, leg_id):
+        """使用預編譯的 CasADi Jacobian 函數"""
+        return self.jac_casadi_funcs[leg_id](angles)
+    
+    def forward_kinematics(self, angles, leg_id):
+        """NumPy 版本：直接使用 Pinocchio"""
+        q = np.zeros(self.pin_model.nq)
+        
+        # 設置對應腿的關節角度
+        joint_names = [
+            ['FL_hip_joint', 'FL_thigh_joint', 'FL_calf_joint'],
+            ['FR_hip_joint', 'FR_thigh_joint', 'FR_calf_joint'],
+            ['RL_hip_joint', 'RL_thigh_joint', 'RL_calf_joint'],
+            ['RR_hip_joint', 'RR_thigh_joint', 'RR_calf_joint']
+        ]
+        
+        for i, joint_name in enumerate(joint_names[leg_id]):
+            joint_id = self.pin_model.getJointId(joint_name)
+            q[joint_id - 1] = angles[i]  # -1 because universe joint is at index 0
+        
+        # 計算正向運動學
+        pinocchio.forwardKinematics(self.pin_model, self.pin_data, q)
+        pinocchio.updateFramePlacements(self.pin_model, self.pin_data)
+        
+        # 獲取足端位置
+        foot_frame_names = ['FL_foot', 'FR_foot', 'RL_foot', 'RR_foot']
+        frame_id = self.pin_model.getFrameId(foot_frame_names[leg_id])
+        foot_pos = self.pin_data.oMf[frame_id].translation.copy()
+        
+        return foot_pos
 
 if __name__ == "__main__":
     # Initialize ROS2
@@ -1412,7 +1550,8 @@ if __name__ == "__main__":
 
     # check mocap data validity
     if not np.all(mocap_pos_body == 0) and not np.any(np.isnan(mocap_pos_body)):
-        init_pos = mocap_pos_body
+        # init_pos = mocap_pos_body
+        init_pos = np.array([0, 0, mipo_config.get('init_body_height', 0.32)])
         print(f"Using mocap initial position: {init_pos}")
     else:
         init_pos = np.array([0, 0, mipo_config.get('init_body_height', 0.32)])

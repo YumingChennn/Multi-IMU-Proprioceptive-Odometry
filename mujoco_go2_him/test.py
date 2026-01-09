@@ -1127,8 +1127,6 @@ class MIPOFilter:
         # Yaw measurement residual
         # MATLAB: meas_residual(end) = yawk - euler(3)
         yaw_residual = yawk - euler[2]
-        # CasADi angle wrapping: atan2(sin(angle), cos(angle))
-        yaw_residual = ca.atan2(ca.sin(yaw_residual), ca.cos(yaw_residual))
         residual_list.append(yaw_residual)
         
         # Concatenate all measurement residuals
