@@ -1324,7 +1324,6 @@ class MIPOFilter:
         
         return np.array([x_bf, y_bf, z_bf])
     
-
 if __name__ == "__main__":
     # Initialize ROS2
     rclpy.init()

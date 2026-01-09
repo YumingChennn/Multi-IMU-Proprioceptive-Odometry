@@ -238,17 +238,6 @@ class MIPOFilter:
         self._extract_robot_parameters()
         self._setup_casadi_kinematics()
         self.mipo_conf_init()
-        
-        self.gravity = np.array([0, 0, -9.81])
-        
-        # Define joint indices for each leg (3 joints per leg)
-        # Go2 robot joint order: FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf, ...
-        self.leg_joint_indices = {
-            0: [0, 1, 2],    # FL: hip, thigh, calf
-            1: [3, 4, 5],    # FR
-            2: [6, 7, 8],    # RL
-            3: [9, 10, 11]   # RR
-        }
 
     def _extract_robot_parameters(self):
         """從 Pinocchio model 自動提取機器人參數"""
@@ -332,12 +321,15 @@ class MIPOFilter:
             
             s1, c1 = ca.sin(q1), ca.cos(q1)
             s2, c2 = ca.sin(q2), ca.cos(q2)
+            s3, c3 = ca.sin(q3), ca.cos(q3)
             s23, c23 = ca.sin(q2+q3), ca.cos(q2+q3)
             
-            # FK 公式
+            # FK 公式（與 MATLAB autoFunc_fk_pf_pos 完全一致）
+            # x 方向不受 q1 (hip angle) 影響
             x_bf = ox - lt*s2 - lc*s23
-            y_bf = oy + d*c1 + lt*c1*c2 + lc*c1*c23
-            z_bf = d*s1 + lt*s1*c2 + lc*s1*c23
+            # y 和 z 方向受 q1 影響（注意是 sin(q1) 不是 cos(q1)）
+            y_bf = oy + d*c1 + lt*s1*c2 + lc*s1*c2*c3 - lc*s1*s2*s3
+            z_bf = d*s1 - lt*c1*c2 - lc*c1*c2*c3 + lc*c1*s2*s3
             
             foot_pos = ca.vertcat(x_bf, y_bf, z_bf)
             
@@ -755,7 +747,7 @@ class MIPOFilter:
             idx_height = i * self.meas_per_leg + 9
             self.R[idx_height, idx_height] = cfg['meas_n_foot_height']  # 0.001
       
-    def update(self, x_pred, P_pred, wk, joint_angles, joint_vels, yawk, gyro_feet, contact_flags):
+    def update(self, x_pred, P_pred, wk, joint_angles, joint_vels, yawk, gyro_feet):
         """EKF Update step
         
         Args:
@@ -766,7 +758,6 @@ class MIPOFilter:
             joint_vels: Joint velocities (12,)
             yawk: Yaw measurement (scalar)
             gyro_feet: Foot gyro measurements (12,)
-            contact_flags: Contact flags (4,)
         """
         
         # Predicted measurement
@@ -785,7 +776,7 @@ class MIPOFilter:
         
         # Mahalanobis distance test (outlier rejection)
         # MATLAB: mask = ones(meas_size,1); then set mask=0 if MD > 4
-        mask = self.mahalanobis_test(y, S, contact_flags)
+        mask = self.mahalanobis_test(y, S)
         
         # Kalman gain computation
         # MATLAB: update = P01 * H(mask,:)' * (S(mask,mask)\y(mask))
@@ -847,7 +838,7 @@ class MIPOFilter:
         H = self.H_jac_casadi(x, wk, joint_angles, joint_vels, yawk, gyro_feet).full()
         return H
     
-    def mahalanobis_test(self, innovation, S, contact_flags, threshold=3.0):
+    def mahalanobis_test(self, innovation, S, threshold=3.0):
         """Mahalanobis distance test for outlier rejection - matching MATLAB (threshold=3)
         
         MATLAB code:
@@ -1239,138 +1230,6 @@ class MIPOFilter:
         # Total: 4 legs × 11 residuals + 1 yaw = 45 dimensions (matching MATLAB)
         return ca.vertcat(*residual_list)
     
-    # def _forward_kinematics_symbolic(self, angles, leg_id):
-    #     """
-    #     符號版本的正向運動學 - 對應 MATLAB 的 autoFunc_fk_pf_pos
-    #     使用 Go2 機器人的實際運動學參數
-        
-    #     Args:
-    #         angles: Joint angles [hip, thigh, calf] (3,) - CasADi symbolic
-    #         leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
-            
-    #     Returns:
-    #         foot_pos: Foot position in body frame (3,) - CasADi symbolic
-            
-    #     MATLAB equivalent:
-    #         p_bf = autoFunc_fk_pf_pos(angles, lc, rho_fix)
-    #         where rho_fix = [ox; oy; d; lt]
-    #     """
-
-    #     # Go2 robot parameters from URDF (對應 MATLAB 的 param)
-    #     # FL, FR, RL, RR
-    #     ox_list = [0.1934, 0.1934, -0.1934, -0.1934]   # Hip offset X
-    #     oy_list = [0.0465, -0.0465, 0.0465, -0.0465]   # Hip offset Y
-    #     d_list = [0.0955, -0.0955, 0.0955, -0.0955]     # Hip offset Z (abad link length)
-        
-    #     lt = 0.213  # Thigh length
-    #     lc = 0.213  # Calf length
-        
-    #     # Get parameters for this leg (對應 MATLAB 的 rho_fix(:,i))
-    #     ox = ox_list[leg_id]
-    #     oy = oy_list[leg_id]
-    #     d = d_list[leg_id]
-        
-    #     # MATLAB formula (符號數學工具箱生成的精確公式):
-    #     # p_bf = [ox-lt.*t9-lc.*sin(t2+t3);
-    #     #         oy+d.*t5+lt.*t6.*t8+lc.*t6.*t7.*t8-lc.*t8.*t9.*t10;
-    #     #         d.*t8-lt.*t5.*t6-lc.*t5.*t6.*t7+lc.*t5.*t9.*t10];
-    #     # where:
-    #     #   t5 = cos(t1), t6 = cos(t2), t7 = cos(t3)
-    #     #   t8 = sin(t1), t9 = sin(t2), t10 = sin(t3)
-        
-    #     # Extract joint angles (對應 MATLAB 的 t1, t2, t3)
-    #     t1 = angles[0]  # hip angle
-    #     t2 = angles[1]  # thigh angle
-    #     t3 = angles[2]  # calf angle
-    #     t5 = ca.cos(t1)
-    #     t6 = ca.cos(t2)
-    #     t7 = ca.cos(t3)
-    #     t8 = ca.sin(t1)
-    #     t9 = ca.sin(t2)
-    #     t10 = ca.sin(t3)
-        
-    #     # Exact MATLAB formula
-    #     x_bf = ox - lt*t9 - lc*ca.sin(t2 + t3)
-    #     y_bf = oy + d*t5 + lt*t6*t8 + lc*t6*t7*t8 - lc*t8*t9*t10
-    #     z_bf = d*t8 - lt*t5*t6 - lc*t5*t6*t7 + lc*t5*t9*t10
-        
-    #     return ca.vertcat(x_bf, y_bf, z_bf)
-    
-    # def _forward_kinematics_jacobian(self, angles, leg_id):
-    #     """
-    #     Jacobian of forward kinematics - 對應 MATLAB 的 autoFunc_d_fk_dt
-    #     使用 Go2 機器人的實際運動學參數
-        
-    #     Args:
-    #         angles: Joint angles [hip, thigh, calf] (3,) - CasADi symbolic
-    #         leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
-            
-    #     Returns:
-    #         J: Jacobian matrix (3x3) - ∂p_bf/∂angles
-            
-    #     MATLAB equivalent:
-    #         J = autoFunc_d_fk_dt(angles, lc, rho_fix)
-    #         where rho_fix = [ox; oy; d; lt]
-    #     """
-    #     # Go2 robot parameters from URDF
-    #     ox_list = [0.1934, 0.1934, -0.1934, -0.1934]
-    #     oy_list = [0.0465, -0.0465, 0.0465, -0.0465]
-    #     d_list = [0.0955, -0.0955, 0.0955, -0.0955]
-        
-    #     lt = 0.213  # Thigh length
-    #     lc = 0.213  # Calf length
-        
-    #     # Get parameters for this leg
-    #     ox = ox_list[leg_id]
-    #     oy = oy_list[leg_id]
-    #     d = d_list[leg_id]
-        
-    #     # Extract joint angles
-    #     t1 = angles[0]  # hip angle
-    #     t2 = angles[1]  # thigh angle
-    #     t3 = angles[2]  # calf angle
-        
-    #     # Precompute trig functions (matching MATLAB variable names)
-    #     t5 = ca.cos(t1)
-    #     t6 = ca.cos(t2)
-    #     t7 = ca.cos(t3)
-    #     t8 = ca.sin(t1)
-    #     t9 = ca.sin(t2)
-    #     t10 = ca.sin(t3)
-    #     t11 = t2 + t3
-    #     t12 = ca.cos(t11)
-    #     t13 = lt * t9
-    #     t14 = ca.sin(t11)
-    #     t15 = lc * t12
-    #     t16 = lc * t14
-    #     t17 = -t15
-    #     t18 = t13 + t16
-        
-    #     # MATLAB formula: jacobian = reshape([...], [3,3])
-    #     # Column 1: ∂p_bf/∂t1
-    #     j11 = 0.0
-    #     j21 = -d*t8 + lt*t5*t6 + lc*t5*t6*t7 - lc*t5*t9*t10
-    #     j31 = d*t5 + lt*t6*t8 + lc*t6*t7*t8 - lc*t8*t9*t10
-        
-    #     # Column 2: ∂p_bf/∂t2
-    #     j12 = t17 - lt*t6
-    #     j22 = -t8*t18
-    #     j32 = t5*t18
-        
-    #     # Column 3: ∂p_bf/∂t3
-    #     j13 = t17
-    #     j23 = -t8*t16
-    #     j33 = t5*t16
-        
-    #     # Construct Jacobian matrix (3x3)
-    #     J = ca.vertcat(
-    #         ca.horzcat(j11, j12, j13),
-    #         ca.horzcat(j21, j22, j23),
-    #         ca.horzcat(j31, j32, j33)
-    #     )
-        
-    #     return J
-    
     @staticmethod
     def _skew_symmetric(v):
         """
@@ -1388,45 +1247,6 @@ class MIPOFilter:
             ca.horzcat(v[2], 0, -v[0]),
             ca.horzcat(-v[1], v[0], 0)
         )
-    
-    # def forward_kinematics(self, angles, leg_id):
-    #     """
-    #     Compute foot position from joint angles using exact MATLAB formula
-    #     Replaces Pinocchio with analytical forward kinematics
-        
-    #     Args:
-    #         angles: Joint angles for one leg [hip, thigh, calf] (3,)
-    #         leg_id: Leg identifier 0=FL, 1=FR, 2=RL, 3=RR
-            
-    #     Returns:
-    #         foot_pos: Foot position in body frame (3,) - NumPy array
-    #     """
-    #     # Go2 robot parameters (matching MATLAB)
-    #     ox_list = [0.1934, 0.1934, -0.1934, -0.1934]
-    #     oy_list = [0.0465, -0.0465, 0.0465, -0.0465]
-    #     d_list = [0.0955, -0.0955, 0.0955, -0.0955]
-    #     lt = 0.213
-    #     lc = 0.213
-        
-    #     ox = ox_list[leg_id]
-    #     oy = oy_list[leg_id]
-    #     d = d_list[leg_id]
-        
-    #     # Extract joint angles
-    #     t1, t2, t3 = angles[0], angles[1], angles[2]
-    #     t5 = np.cos(t1)
-    #     t6 = np.cos(t2)
-    #     t7 = np.cos(t3)
-    #     t8 = np.sin(t1)
-    #     t9 = np.sin(t2)
-    #     t10 = np.sin(t3)
-        
-    #     # MATLAB formula from autoFunc_fk_pf_pos
-    #     x_bf = ox - lt*t9 - lc*np.sin(t2 + t3)
-    #     y_bf = oy + d*t5 + lt*t6*t8 + lc*t6*t7*t8 - lc*t8*t9*t10
-    #     z_bf = d*t8 - lt*t5*t6 - lc*t5*t6*t7 + lc*t5*t9*t10
-        
-    #     return np.array([x_bf, y_bf, z_bf])
     
     def _forward_kinematics_symbolic(self, angles, leg_id):
         """使用預編譯的 CasADi 函數（參數從 URDF 提取）"""
@@ -1666,8 +1486,6 @@ if __name__ == "__main__":
                     [dt]                      # hk - time step (1)
                 ])  # Total: 19 dimensions (dt is also passed as separate parameter to RK4)
                 
-                contact_flags = (foot_forces > 5.0).astype(float)
-                
                 if u_k_prev is not None:
                     u_k = u_k_prev  
                 else:
@@ -1688,7 +1506,7 @@ if __name__ == "__main__":
                 yawk = euler_from_quat[2]  # Yaw angle
                 
                 # Use transformed gyro data (in body frame)
-                mipo.update(x_pred, P_pred, wk, joint_angles, joint_vels, yawk, gyro_feet_body, contact_flags)
+                mipo.update(x_pred, P_pred, wk, joint_angles, joint_vels, yawk, gyro_feet_body)
                 
                 # Record MIPO estimates
                 mipo_pos_list.append(mipo.x[0:3].copy())
